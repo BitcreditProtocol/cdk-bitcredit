@@ -16,6 +16,42 @@ use crate::nut02::ShortKeysetId;
 use crate::nuts::{CurrencyUnit, Id};
 use crate::{ensure_cdk, Amount, KeySetInfo};
 
+pub trait TokenIdentifier {
+    const READABLE_IDENTIFIER: &'static str;
+    const RAW_IDENTIFIER: &'static str;
+
+    fn starts_with_readable(s: &str) -> bool {
+        s.starts_with(Self::READABLE_IDENTIFIER)
+    }
+    fn strip_readable(s: &str) -> Result<&str, Error> {
+        s.strip_prefix(Self::READABLE_IDENTIFIER)
+            .ok_or(Error::UnsupportedToken)
+    }
+    fn prefix_readable(inner: &str) -> String {
+        format!("{}{}", Self::READABLE_IDENTIFIER, inner)
+    }
+
+    fn starts_with_raw(s: &[u8]) -> bool {
+        s.starts_with(Self::RAW_IDENTIFIER.as_bytes())
+    }
+    fn strip_raw(s: &[u8]) -> Result<&[u8], Error> {
+        s.strip_prefix(Self::RAW_IDENTIFIER.as_bytes())
+            .ok_or(Error::UnsupportedToken)
+    }
+    fn prefix_raw(inner: &[u8]) -> Vec<u8> {
+        let mut retv = Self::RAW_IDENTIFIER.as_bytes().to_vec();
+        retv.extend_from_slice(inner);
+        retv
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CashuIdentifier {}
+impl TokenIdentifier for CashuIdentifier {
+    const READABLE_IDENTIFIER: &'static str = "cashu";
+    const RAW_IDENTIFIER: &'static str = "craw";
+}
+
 /// Token Enum
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
@@ -62,6 +98,7 @@ impl Token {
             unit,
             memo,
             token: proofs,
+            _phantom: std::marker::PhantomData,
         })
     }
 
@@ -197,7 +234,7 @@ impl TokenV3Token {
 
 /// Token
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TokenV3 {
+pub struct TokenV3<TI = CashuIdentifier> {
     /// Proofs in [`Token`] by mint
     pub token: Vec<TokenV3Token>,
     /// Memo for token
@@ -206,9 +243,12 @@ pub struct TokenV3 {
     /// Token Unit
     #[serde(skip_serializing_if = "Option::is_none")]
     pub unit: Option<CurrencyUnit>,
+
+    #[serde(skip)]
+    _phantom: std::marker::PhantomData<TI>,
 }
 
-impl TokenV3 {
+impl<TI> TokenV3<TI> {
     /// Create new [`Token`]
     pub fn new(
         mint_url: MintUrl,
@@ -222,6 +262,7 @@ impl TokenV3 {
             token: vec![TokenV3Token::new(mint_url, proofs)],
             memo,
             unit,
+            _phantom: std::marker::PhantomData,
         })
     }
 
@@ -290,30 +331,37 @@ impl TokenV3 {
     }
 }
 
-impl FromStr for TokenV3 {
+impl<TI> FromStr for TokenV3<TI>
+where
+    TI: TokenIdentifier,
+{
     type Err = Error;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let s = s.strip_prefix("cashuA").ok_or(Error::UnsupportedToken)?;
+        let s = TI::strip_readable(s)?;
+        let s = s.strip_prefix("A").ok_or(Error::UnsupportedToken)?;
 
         let decode_config = general_purpose::GeneralPurposeConfig::new()
             .with_decode_padding_mode(bitcoin::base64::engine::DecodePaddingMode::Indifferent);
         let decoded = GeneralPurpose::new(&alphabet::URL_SAFE, decode_config).decode(s)?;
         let decoded_str = String::from_utf8(decoded)?;
-        let token: TokenV3 = serde_json::from_str(&decoded_str)?;
+        let token: TokenV3::<TI> = serde_json::from_str(&decoded_str)?;
         Ok(token)
     }
 }
 
-impl fmt::Display for TokenV3 {
+impl<TI> fmt::Display for TokenV3<TI>
+where
+    TI: TokenIdentifier,
+{
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let json_string = serde_json::to_string(self).map_err(|_| fmt::Error)?;
         let encoded = general_purpose::URL_SAFE.encode(json_string);
-        write!(f, "cashuA{encoded}")
+        write!(f, "{}A{encoded}", TI::READABLE_IDENTIFIER)
     }
 }
 
-impl From<TokenV4> for TokenV3 {
+impl<TI> From<TokenV4> for TokenV3<TI> {
     fn from(token: TokenV4) -> Self {
         let proofs: Vec<ProofV3> = token
             .token
@@ -338,13 +386,14 @@ impl From<TokenV4> for TokenV3 {
             token: vec![token_v3_token],
             memo: token.memo,
             unit: Some(token.unit),
+            _phantom: std::marker::PhantomData,
         }
     }
 }
 
 /// Token V4
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TokenV4 {
+pub struct TokenV4<TI = CashuIdentifier> {
     /// Mint Url
     #[serde(rename = "m")]
     pub mint_url: MintUrl,
@@ -357,9 +406,14 @@ pub struct TokenV4 {
     /// Proofs grouped by keyset_id
     #[serde(rename = "t")]
     pub token: Vec<TokenV4Token>,
+    #[serde(skip)]
+    _phantom: std::marker::PhantomData<TI>,
 }
 
-impl TokenV4 {
+impl<TI> TokenV4<TI>
+where
+    TI: TokenIdentifier,
+{
     /// Proofs from token
     pub fn proofs(&self, mint_keysets: &[KeySetInfo]) -> Result<Proofs, Error> {
         let mut proofs: Proofs = vec![];
@@ -391,7 +445,6 @@ impl TokenV4 {
                 .collect::<Result<Vec<Amount>, _>>()?,
         )?)
     }
-
     /// Memo
     #[inline]
     pub fn memo(&self) -> &Option<String> {
@@ -406,7 +459,7 @@ impl TokenV4 {
 
     /// Serialize the token to raw binary
     pub fn to_raw_bytes(&self) -> Result<Vec<u8>, Error> {
-        let mut prefix = b"crawB".to_vec();
+        let mut prefix = TI::prefix_raw("B".as_bytes());
         let mut data = Vec::new();
         ciborium::into_writer(self, &mut data).map_err(Error::CiboriumSerError)?;
         prefix.extend(data);
@@ -414,40 +467,49 @@ impl TokenV4 {
     }
 }
 
-impl fmt::Display for TokenV4 {
+impl<TI> fmt::Display for TokenV4<TI>
+where
+    TI: TokenIdentifier,
+{
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         use serde::ser::Error;
         let mut data = Vec::new();
         ciborium::into_writer(self, &mut data).map_err(|e| fmt::Error::custom(e.to_string()))?;
         let encoded = general_purpose::URL_SAFE.encode(data);
-        write!(f, "cashuB{encoded}")
+        write!(f, "{}B{encoded}", TI::READABLE_IDENTIFIER)
     }
 }
 
-impl FromStr for TokenV4 {
+impl<TI> FromStr for TokenV4<TI>
+where
+    TI: TokenIdentifier,
+{
     type Err = Error;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let s = s.strip_prefix("cashuB").ok_or(Error::UnsupportedToken)?;
+        let s = TI::strip_readable(s)?;
+        let s = s.strip_prefix("B").ok_or(Error::UnsupportedToken)?;
 
         let decode_config = general_purpose::GeneralPurposeConfig::new()
             .with_decode_padding_mode(bitcoin::base64::engine::DecodePaddingMode::Indifferent);
         let decoded = GeneralPurpose::new(&alphabet::URL_SAFE, decode_config).decode(s)?;
-        let token: TokenV4 = ciborium::from_reader(&decoded[..])?;
+        let token: TokenV4<TI> = ciborium::from_reader(&decoded[..])?;
         Ok(token)
     }
 }
 
-impl TryFrom<&Vec<u8>> for TokenV4 {
+impl<TI> TryFrom<&Vec<u8>> for TokenV4<TI>
+where
+    TI: TokenIdentifier,
+{
     type Error = Error;
 
     fn try_from(bytes: &Vec<u8>) -> Result<Self, Self::Error> {
-        ensure_cdk!(bytes.len() >= 5, Error::UnsupportedToken);
+        ensure_cdk!(TI::starts_with_raw(bytes), Error::UnsupportedToken);
+        let bytes = TI::strip_raw(bytes)?;
+        ensure_cdk!(bytes.starts_with("B".as_bytes()), Error::UnsupportedToken);
 
-        let prefix = String::from_utf8(bytes[..5].to_vec())?;
-        ensure_cdk!(prefix.as_str() == "crawB", Error::UnsupportedToken);
-
-        Ok(ciborium::from_reader(&bytes[5..])?)
+        Ok(ciborium::from_reader(&bytes[1..])?)
     }
 }
 
@@ -484,6 +546,7 @@ impl TryFrom<TokenV3> for TokenV4 {
             token: proofs,
             memo: token.memo,
             unit: token.unit.ok_or(Error::UnsupportedUnit)?,
+            _phantom: std::marker::PhantomData,
         })
     }
 }
@@ -546,7 +609,7 @@ mod tests {
     fn test_token_padding() {
         let token_str_with_padding = "cashuAeyJ0b2tlbiI6W3sibWludCI6Imh0dHBzOi8vODMzMy5zcGFjZTozMzM4IiwicHJvb2ZzIjpbeyJhbW91bnQiOjIsImlkIjoiMDA5YTFmMjkzMjUzZTQxZSIsInNlY3JldCI6IjQwNzkxNWJjMjEyYmU2MWE3N2UzZTZkMmFlYjRjNzI3OTgwYmRhNTFjZDA2YTZhZmMyOWUyODYxNzY4YTc4MzciLCJDIjoiMDJiYzkwOTc5OTdkODFhZmIyY2M3MzQ2YjVlNDM0NWE5MzQ2YmQyYTUwNmViNzk1ODU5OGE3MmYwY2Y4NTE2M2VhIn0seyJhbW91bnQiOjgsImlkIjoiMDA5YTFmMjkzMjUzZTQxZSIsInNlY3JldCI6ImZlMTUxMDkzMTRlNjFkNzc1NmIwZjhlZTBmMjNhNjI0YWNhYTNmNGUwNDJmNjE0MzNjNzI4YzcwNTdiOTMxYmUiLCJDIjoiMDI5ZThlNTA1MGI4OTBhN2Q2YzA5NjhkYjE2YmMxZDVkNWZhMDQwZWExZGUyODRmNmVjNjlkNjEyOTlmNjcxMDU5In1dfV0sInVuaXQiOiJzYXQiLCJtZW1vIjoiVGhhbmsgeW91IHZlcnkgbXVjaC4ifQ==";
 
-        let token = TokenV3::from_str(token_str_with_padding).unwrap();
+        let token: TokenV3 = TokenV3::from_str(token_str_with_padding).unwrap();
 
         let token_str_without_padding = "cashuAeyJ0b2tlbiI6W3sibWludCI6Imh0dHBzOi8vODMzMy5zcGFjZTozMzM4IiwicHJvb2ZzIjpbeyJhbW91bnQiOjIsImlkIjoiMDA5YTFmMjkzMjUzZTQxZSIsInNlY3JldCI6IjQwNzkxNWJjMjEyYmU2MWE3N2UzZTZkMmFlYjRjNzI3OTgwYmRhNTFjZDA2YTZhZmMyOWUyODYxNzY4YTc4MzciLCJDIjoiMDJiYzkwOTc5OTdkODFhZmIyY2M3MzQ2YjVlNDM0NWE5MzQ2YmQyYTUwNmViNzk1ODU5OGE3MmYwY2Y4NTE2M2VhIn0seyJhbW91bnQiOjgsImlkIjoiMDA5YTFmMjkzMjUzZTQxZSIsInNlY3JldCI6ImZlMTUxMDkzMTRlNjFkNzc1NmIwZjhlZTBmMjNhNjI0YWNhYTNmNGUwNDJmNjE0MzNjNzI4YzcwNTdiOTMxYmUiLCJDIjoiMDI5ZThlNTA1MGI4OTBhN2Q2YzA5NjhkYjE2YmMxZDVkNWZhMDQwZWExZGUyODRmNmVjNjlkNjEyOTlmNjcxMDU5In1dfV0sInVuaXQiOiJzYXQiLCJtZW1vIjoiVGhhbmsgeW91IHZlcnkgbXVjaC4ifQ";
 
@@ -558,7 +621,7 @@ mod tests {
     #[test]
     fn test_token_v4_str_round_trip() {
         let token_str = "cashuBpGF0gaJhaUgArSaMTR9YJmFwgaNhYQFhc3hAOWE2ZGJiODQ3YmQyMzJiYTc2ZGIwZGYxOTcyMTZiMjlkM2I4Y2MxNDU1M2NkMjc4MjdmYzFjYzk0MmZlZGI0ZWFjWCEDhhhUP_trhpXfStS6vN6So0qWvc2X3O4NfM-Y1HISZ5JhZGlUaGFuayB5b3VhbXVodHRwOi8vbG9jYWxob3N0OjMzMzhhdWNzYXQ=";
-        let token = TokenV4::from_str(token_str).unwrap();
+        let token: TokenV4 = TokenV4::from_str(token_str).unwrap();
 
         assert_eq!(
             token.mint_url,
@@ -622,7 +685,7 @@ mod tests {
     fn test_token_str_round_trip() {
         let token_str = "cashuAeyJ0b2tlbiI6W3sibWludCI6Imh0dHBzOi8vODMzMy5zcGFjZTozMzM4IiwicHJvb2ZzIjpbeyJhbW91bnQiOjIsImlkIjoiMDA5YTFmMjkzMjUzZTQxZSIsInNlY3JldCI6IjQwNzkxNWJjMjEyYmU2MWE3N2UzZTZkMmFlYjRjNzI3OTgwYmRhNTFjZDA2YTZhZmMyOWUyODYxNzY4YTc4MzciLCJDIjoiMDJiYzkwOTc5OTdkODFhZmIyY2M3MzQ2YjVlNDM0NWE5MzQ2YmQyYTUwNmViNzk1ODU5OGE3MmYwY2Y4NTE2M2VhIn0seyJhbW91bnQiOjgsImlkIjoiMDA5YTFmMjkzMjUzZTQxZSIsInNlY3JldCI6ImZlMTUxMDkzMTRlNjFkNzc1NmIwZjhlZTBmMjNhNjI0YWNhYTNmNGUwNDJmNjE0MzNjNzI4YzcwNTdiOTMxYmUiLCJDIjoiMDI5ZThlNTA1MGI4OTBhN2Q2YzA5NjhkYjE2YmMxZDVkNWZhMDQwZWExZGUyODRmNmVjNjlkNjEyOTlmNjcxMDU5In1dfV0sInVuaXQiOiJzYXQiLCJtZW1vIjoiVGhhbmsgeW91LiJ9";
 
-        let token = TokenV3::from_str(token_str).unwrap();
+        let token: TokenV3 = TokenV3::from_str(token_str).unwrap();
         assert_eq!(
             token.token[0].mint,
             MintUrl::from_str("https://8333.space:3338").unwrap()
@@ -644,19 +707,19 @@ mod tests {
     fn incorrect_tokens() {
         let incorrect_prefix = "casshuAeyJ0b2tlbiI6W3sibWludCI6Imh0dHBzOi8vODMzMy5zcGFjZTozMzM4IiwicHJvb2ZzIjpbeyJhbW91bnQiOjIsImlkIjoiMDA5YTFmMjkzMjUzZTQxZSIsInNlY3JldCI6IjQwNzkxNWJjMjEyYmU2MWE3N2UzZTZkMmFlYjRjNzI3OTgwYmRhNTFjZDA2YTZhZmMyOWUyODYxNzY4YTc4MzciLCJDIjoiMDJiYzkwOTc5OTdkODFhZmIyY2M3MzQ2YjVlNDM0NWE5MzQ2YmQyYTUwNmViNzk1ODU5OGE3MmYwY2Y4NTE2M2VhIn0seyJhbW91bnQiOjgsImlkIjoiMDA5YTFmMjkzMjUzZTQxZSIsInNlY3JldCI6ImZlMTUxMDkzMTRlNjFkNzc1NmIwZjhlZTBmMjNhNjI0YWNhYTNmNGUwNDJmNjE0MzNjNzI4YzcwNTdiOTMxYmUiLCJDIjoiMDI5ZThlNTA1MGI4OTBhN2Q2YzA5NjhkYjE2YmMxZDVkNWZhMDQwZWExZGUyODRmNmVjNjlkNjEyOTlmNjcxMDU5In1dfV0sInVuaXQiOiJzYXQiLCJtZW1vIjoiVGhhbmsgeW91LiJ9";
 
-        let incorrect_prefix_token = TokenV3::from_str(incorrect_prefix);
+        let incorrect_prefix_token  = TokenV3::<CashuIdentifier>::from_str(incorrect_prefix);
 
         assert!(incorrect_prefix_token.is_err());
 
         let no_prefix = "eyJ0b2tlbiI6W3sibWludCI6Imh0dHBzOi8vODMzMy5zcGFjZTozMzM4IiwicHJvb2ZzIjpbeyJhbW91bnQiOjIsImlkIjoiMDA5YTFmMjkzMjUzZTQxZSIsInNlY3JldCI6IjQwNzkxNWJjMjEyYmU2MWE3N2UzZTZkMmFlYjRjNzI3OTgwYmRhNTFjZDA2YTZhZmMyOWUyODYxNzY4YTc4MzciLCJDIjoiMDJiYzkwOTc5OTdkODFhZmIyY2M3MzQ2YjVlNDM0NWE5MzQ2YmQyYTUwNmViNzk1ODU5OGE3MmYwY2Y4NTE2M2VhIn0seyJhbW91bnQiOjgsImlkIjoiMDA5YTFmMjkzMjUzZTQxZSIsInNlY3JldCI6ImZlMTUxMDkzMTRlNjFkNzc1NmIwZjhlZTBmMjNhNjI0YWNhYTNmNGUwNDJmNjE0MzNjNzI4YzcwNTdiOTMxYmUiLCJDIjoiMDI5ZThlNTA1MGI4OTBhN2Q2YzA5NjhkYjE2YmMxZDVkNWZhMDQwZWExZGUyODRmNmVjNjlkNjEyOTlmNjcxMDU5In1dfV0sInVuaXQiOiJzYXQiLCJtZW1vIjoiVGhhbmsgeW91LiJ9";
 
-        let no_prefix_token = TokenV3::from_str(no_prefix);
+        let no_prefix_token = TokenV3::<CashuIdentifier>::from_str(no_prefix);
 
         assert!(no_prefix_token.is_err());
 
         let correct_token = "cashuAeyJ0b2tlbiI6W3sibWludCI6Imh0dHBzOi8vODMzMy5zcGFjZTozMzM4IiwicHJvb2ZzIjpbeyJhbW91bnQiOjIsImlkIjoiMDA5YTFmMjkzMjUzZTQxZSIsInNlY3JldCI6IjQwNzkxNWJjMjEyYmU2MWE3N2UzZTZkMmFlYjRjNzI3OTgwYmRhNTFjZDA2YTZhZmMyOWUyODYxNzY4YTc4MzciLCJDIjoiMDJiYzkwOTc5OTdkODFhZmIyY2M3MzQ2YjVlNDM0NWE5MzQ2YmQyYTUwNmViNzk1ODU5OGE3MmYwY2Y4NTE2M2VhIn0seyJhbW91bnQiOjgsImlkIjoiMDA5YTFmMjkzMjUzZTQxZSIsInNlY3JldCI6ImZlMTUxMDkzMTRlNjFkNzc1NmIwZjhlZTBmMjNhNjI0YWNhYTNmNGUwNDJmNjE0MzNjNzI4YzcwNTdiOTMxYmUiLCJDIjoiMDI5ZThlNTA1MGI4OTBhN2Q2YzA5NjhkYjE2YmMxZDVkNWZhMDQwZWExZGUyODRmNmVjNjlkNjEyOTlmNjcxMDU5In1dfV0sInVuaXQiOiJzYXQiLCJtZW1vIjoiVGhhbmsgeW91LiJ9";
 
-        let correct_token = TokenV3::from_str(correct_token);
+        let correct_token = TokenV3::<CashuIdentifier>::from_str(correct_token);
 
         assert!(correct_token.is_ok());
     }
@@ -664,7 +727,7 @@ mod tests {
     #[test]
     fn test_token_v4_raw_roundtrip() {
         let token_raw = hex::decode("6372617742a4617481a261694800ad268c4d1f5826617081a3616101617378403961366462623834376264323332626137366462306466313937323136623239643362386363313435353363643237383237666331636339343266656462346561635821038618543ffb6b8695df4ad4babcde92a34a96bdcd97dcee0d7ccf98d4721267926164695468616e6b20796f75616d75687474703a2f2f6c6f63616c686f73743a33333338617563736174").unwrap();
-        let token = TokenV4::try_from(&token_raw).expect("Token deserialization error");
+        let token: TokenV4 = TokenV4::try_from(&token_raw).expect("Token deserialization error");
         let token_raw_ = token.to_raw_bytes().expect("Token serialization error");
         let token_ = TokenV4::try_from(&token_raw_).expect("Token deserialization error");
         assert!(token_ == token)
@@ -674,7 +737,8 @@ mod tests {
     fn test_token_generic_raw_roundtrip() {
         let tokenv4_raw = hex::decode("6372617742a4617481a261694800ad268c4d1f5826617081a3616101617378403961366462623834376264323332626137366462306466313937323136623239643362386363313435353363643237383237666331636339343266656462346561635821038618543ffb6b8695df4ad4babcde92a34a96bdcd97dcee0d7ccf98d4721267926164695468616e6b20796f75616d75687474703a2f2f6c6f63616c686f73743a33333338617563736174").unwrap();
         let tokenv4 = Token::try_from(&tokenv4_raw).expect("Token deserialization error");
-        let tokenv4_ = TokenV4::try_from(&tokenv4_raw).expect("Token deserialization error");
+        let tokenv4_: TokenV4 =
+            TokenV4::try_from(&tokenv4_raw).expect("Token deserialization error");
         let tokenv4_bytes = tokenv4.to_raw_bytes().expect("Serialization error");
         let tokenv4_bytes_ = tokenv4_.to_raw_bytes().expect("Serialization error");
         assert!(tokenv4_bytes_ == tokenv4_bytes);
